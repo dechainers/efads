@@ -1,20 +1,21 @@
-from multiprocessing import Process
-from .utility import RunState, AnalysisState
+import json
+import dataclasses
+
+from .utility import GlobalResultManager
 
 
-class AnalysisAdjuster(Process):
-
-    def __init__(self, shared_conf, run_state):
-        Process.__init__(self)
-        self.daemon = True
-        self.shared_conf = shared_conf
-        self.run_state: RunState = run_state
-
-    def on_update(self):
-        self.analysis_state: AnalysisState = self.shared_conf.__deepcopy__({})
-
-    def run(self):
-        self.on_update()
-        # TODO implement
-        while True:
-            pass
+class AnalysisAdjuster:
+    def __init__(self, attackers, dump_file) -> None:
+        self.results = GlobalResultManager(attackers=attackers)
+        self.dump_file = dump_file
+    
+    def handle(self, p, predictions, sess_map_or_packets, pkts_received=0, black_map={}, checkpoints=[]):        
+        self.results.end_tw(predictions, sess_map_or_packets,
+                            pkts_received, black_map, checkpoints)
+    
+    def __del__(self):
+        if not hasattr(self, "results"):
+            return
+        with open(self.dump_file, "w") as fp:
+            json.dump(dataclasses.asdict(self.results), fp, indent=2)
+        del self.results

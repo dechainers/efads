@@ -5,6 +5,7 @@ import socket
 import struct
 import time
 from dataclasses import dataclass, field
+from threading import Thread, Event 
 from multiprocessing.managers import BaseManager, NamespaceProxy
 from typing import Dict, List, OrderedDict
 
@@ -93,13 +94,6 @@ _features_map: Dict = {
     "aggregate": OrderedDict([])
 }
 
-_costs_map: Dict = {
-    "perpacket": OrderedDict([
-        
-    ]),
-    "aggregate": OrderedDict([])
-}
-
 
 @dataclass
 class DebugConfiguration:
@@ -125,7 +119,7 @@ class RunState:
     operational_mode: str = "simulated"
     debug: DebugConfiguration = None
     mode: int = BPF.SCHED_CLS
-    main_pid: int = -1
+    daemon: bool = False
 
 
 @dataclass
@@ -187,9 +181,7 @@ class AnalysisState:
     def keys_size(self):
         return sum([ct.sizeof(v[1]) for v in _keys_map.values()])
     
-    def reconstruct_programs(self, prog_owner_pid: int, mode: int):
-        if os.getpid() == prog_owner_pid or os.getppid() != prog_owner_pid:
-            raise Exception("Cannot run this function here")
+    def reconstruct_programs(self, mode: int):
         ret = {}
         for htype in ['ingress', 'egress']:
             ret[htype] = None
@@ -203,6 +195,7 @@ class AnalysisState:
                             cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
                             program_id=hook.program_id, features=hook.bpf_features)
                 p.bpf.module = hook.module_fd
+                p.bpf.cleanup = lambda: None
             else:
                 p = SwapStateCompile(interface=None, idx=None, mode=mode, code='int internal_handler(){return 0;}',
                                      cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
@@ -211,6 +204,8 @@ class AnalysisState:
                                          htype, 'xdp' if mode == BPF.XDP else 'tc'), features=hook.bpf_features)
                 p.bpf.module = hook.module_fd
                 p.bpf_1.module = hook.module_swap_fd
+                p.bpf.cleanup = lambda: None
+                p.bpf_1.cleanup = lambda: None
             ret[htype] = p
         return ret
 
