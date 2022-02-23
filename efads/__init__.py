@@ -24,17 +24,18 @@ from .utility import AnalysisState, MyManager, HookModulesConfig, RunState
 from .traffic_analyser import BaseAnalyser, SimulatedAnalyser, WithProcess
 
 
-# TODO: Model e Features devono essere trovati in maniera dinamica
+# TODO: implementa in sotto classi le componenti async if needed
+# TODO: implementa hook per registrare o eliminare definizioni di features
 @dataclass
 class Efads(Probe):
     operational_modes: ClassVar[List] = [
         "simulated", "socket", "full_ebpf", "filtered_ebpf"]
-    
+
     run_state: RunState = field(default_factory=RunState)
     analysis_state: AnalysisState = field(default_factory=AnalysisState)
 
     proc: Union[Type[BaseAnalyser], WithProcess] = None
-    
+
     def __post_init__(self):
         if self.run_state.operational_mode not in Efads.operational_modes:
             raise Exception("Operational Mode incorrect or missing")
@@ -45,7 +46,7 @@ class Efads(Probe):
             if not self.run_state.debug.pcaps:
                 raise Exception("Need pcaps for the simulations")
             self.run_state.daemon = False
-        
+
         base_dir = os.path.dirname(__file__)
         shutil.copyfile(os.path.join(base_dir, 'ebpf_{}.c'.format(
             self.analysis_state.extraction_type)), os.path.join(base_dir, 'ebpf.c'))
@@ -57,7 +58,7 @@ class Efads(Probe):
             chook = getattr(self, hook)
             if chook.required:
                 chook.cflags = self.cflags_from_state()
-        
+
         self.run_state.interface = self.interface
         self.run_state.mode = self.mode
         super().__post_init__(path=__file__)
@@ -66,6 +67,9 @@ class Efads(Probe):
         return [
             '-DSESSION_PER_TIME_WINDOW={}'.format(
                 self.analysis_state.sessions_per_time_window),
+            '-DSESSION_PER_TIME_WINDOW_MAP={}'.format(
+                self.analysis_state.sessions_per_time_window if self.run_state.operational_mode ==
+                "simulated" else self.analysis_state.max_blocked_sessions),
             '-DTIME_WINDOW={}'.format(self.analysis_state.time_window),
             '-DTEST_{}=1'.format(self.run_state.operational_mode.upper()),
             '-DMAX_BLOCKED_SESSIONS={}'.format(
@@ -82,32 +86,34 @@ class Efads(Probe):
                 continue
             hook.module_fd = p.bpf.module
             if isinstance(p, SwapStateCompile):
-                hook.module_swap_fd = p.bpf_1.module                
+                hook.module_swap_fd = p.bpf_1.module
             hook.program_id = p.program_id
             hook.bpf_features = p.features
-        
+
         aa = SimulatedAnalyser(self)
         if not self.run_state.daemon:
             self.proc = aa
             return
-        
+
         self.manager = MyManager()
         self.manager.start()
-        
-        shared_conf = self.manager.AnalysisState(**self.analysis_state.__dict__)
-        
+
+        shared_conf = self.manager.AnalysisState(
+            **self.analysis_state.__dict__)
+
         if self.run_state.operational_mode == 'simulated':
             self.proc = WithProcess(aa)
         else:
             raise Exception()
-        
+
         self.shared_conf = shared_conf
         self.proc.start()
 
     def update_analysis(self, analysis_state):
-        #self.analysis_state: AnalysisState = self.shared_conf.__deepcopy__({}) #TODO: implement thread
+        # TODO: implement signaling
+        #self.analysis_state: AnalysisState = self.shared_conf.__deepcopy__({})
         pass
-    
+
     def start(self):
         if self.run_state.daemon:
             signal.signal(signal.SIGUSR1, lambda _: None)
@@ -116,30 +122,15 @@ class Efads(Probe):
             self.proc.start()
 
     def __del__(self):
-        if hasattr(self, 'manager'):
+        try:
             self.manager.shutdown()
             del self.manager
-        if hasattr(self, 'proc') and isinstance(self.proc, WithProcess):
-            try:
+        except Exception:
+            pass
+        try:
+            if isinstance(self.proc, WithProcess):
                 os.kill(self.proc.pid, signal.SIGTERM)
-            except Exception:
-                pass
-        del self.proc
-        p = self['ingress']
-        if p:
-            p["BLACKLISTED_IPS"].clear()
-            p.bpf["PACKET_COUNTER"].clear()
-            p.bpf["SESSIONS_TRACKED_DDOS"].clear()
-
-            try:
-                [x for x in p.bpf["PACKET_BUFFER_DDOS"].values()]
-            except Exception:
-                pass
-            
-            if isinstance(p, SwapStateCompile):
-                p.bpf_1["SESSIONS_TRACKED_DDOS_1"].clear()
-                try:
-                    [x for x in p.bpf_1["PACKET_BUFFER_DDOS_1"].values()]    
-                except Exception:
-                    pass
+            del self.proc
+        except Exception:
+            pass
         super().__del__()

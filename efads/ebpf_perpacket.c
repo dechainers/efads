@@ -70,13 +70,29 @@ struct features {
 #endif
 };
 
+struct track_info {
+  u64 packets;
+  u8 is_tracked;
+};
+
 // Map for blacklisting sessions
 // Map for collecting packets
+
+#ifdef TEST_SIMULATED
+BPF_TABLE_SHARED("hash", struct session_key, u64, BLACKLISTED_IPS, MAX_BLOCKED_SESSIONS);
+// 0 PACKETS, 1 N° tracked SESSIONS
+BPF_TABLE_SHARED("array", int, u64, COUNTERS, 2)__attributes__((SWAP));
+static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md) {
+  return PASS;
+}
+#else
+
 // Map support for checking currently tracked sessions
 #if INGRESS
 BPF_TABLE_SHARED("hash", struct session_key, u64, BLACKLISTED_IPS, MAX_BLOCKED_SESSIONS);
-BPF_TABLE_SHARED("array", int, u64, PACKET_COUNTER, 1)__attributes__((SWAP));
-BPF_TABLE_SHARED("hash", struct session_key, u64, SESSIONS_TRACKED_DDOS, SESSION_PER_TIME_WINDOW)__attributes__((SWAP));
+// 0 PACKETS, 1 N° tracked SESSIONS
+BPF_TABLE_SHARED("array", int, u64, COUNTERS, 2)__attributes__((SWAP));
+BPF_TABLE_SHARED("hash", struct session_key, struct track_info, SESSIONS_TRACKED_DDOS, SESSION_PER_TIME_WINDOW_MAP)__attributes__((SWAP));
 #ifdef TEST_EBPF
 BPF_QUEUESTACK_SHARED("queue", PACKET_BUFFER_DDOS, struct features, N_PACKET_TOTAL, 0)__attributes__((SWAP));
 #elif defined TEST_EBPF_PERF
@@ -84,8 +100,8 @@ BPF_PERF_SHARED("perf_output", CUSTOM_TO_CP);
 #endif
 #else
 BPF_TABLE("extern", struct session_key, u64, BLACKLISTED_IPS, MAX_BLOCKED_SESSIONS);
-BPF_TABLE("extern", int, u64, PACKET_COUNTER, 1)__attributes__((SWAP));
-BPF_TABLE("extern", struct session_key, u64, SESSIONS_TRACKED_DDOS, SESSION_PER_TIME_WINDOW)__attributes__((SWAP));
+BPF_TABLE("extern", int, u64, COUNTERS, 2)__attributes__((SWAP));
+BPF_TABLE("extern", struct session_key, struct track_info, SESSIONS_TRACKED_DDOS, SESSION_PER_TIME_WINDOW_MAP)__attributes__((SWAP));
 #ifdef TEST_EBPF
 BPF_QUEUESTACK("extern", PACKET_BUFFER_DDOS, struct features, N_PACKET_TOTAL, 0)__attributes__((SWAP));
 #elif defined TEST_EBPF_PERF
@@ -119,24 +135,25 @@ static __always_inline int check_blacklisted(struct session_key *key, u64 *value
   return 0;
 }
 
-static __always_inline int check_tracked_or_max(struct session_key *key, u64 *value) {
-  u64 zero = 0;
-  value = SESSIONS_TRACKED_DDOS.lookup_or_try_init(key, &zero);
+static __always_inline int check_tracked_or_max(struct session_key *key, struct track_info *value) {
+  value = SESSIONS_TRACKED_DDOS.lookup_or_try_init(key, value);
   if(!value) return 1;
   
-  *value += 1;
+  value->packets += 1;
 
-  if (*value > PACKETS_PER_SESSION) return 1;
+  if (!value->is_tracked){
+    u64 *current_tracked = COUNTERS.lookup(1);
+    if (!current_tracked || *current_tracked >= SESSION_PER_TIME_WINDOW) return 1;
+    value->is_tracked = 1;
+    COUNTERS.increment(1);
+  }
+
+  if (value->packets > PACKETS_PER_SESSION) return 1;
   return 0;
 }
 
 //Default function called at each packet on interface
 static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md) {
-
-#ifdef TEST_SIMULATED
-  return PASS;
-#endif
-
   void *head = (void *) (long) ctx->data;
   void *tail = (void *) (long) ctx->data_end;
 
@@ -155,11 +172,12 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
   u64 *value = NULL;
   struct session_key key = {0};
   struct features new_features = {0};
+  struct track_info infos = {0};
   
   switch (ip->protocol) {
     case IPPROTO_TCP: {
       //Increment seen packets
-      PACKET_COUNTER.increment(0);
+      COUNTERS.increment(0);
 
       /*Parsing L4 TCP*/
       struct tcphdr *tcp = head;
@@ -171,7 +189,7 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
       if(check_blacklisted(&key, value)) return DROP;
 
 #if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
-      if(check_tracked_or_max(&key, value)) return PASS;
+      if(check_tracked_or_max(&key, &infos)) return PASS;
 
 #ifdef TCP_ACK
       new_features.tcp_ack=bpf_ntohl(tcp->ack_seq);
@@ -191,7 +209,7 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
     }
     case IPPROTO_UDP: {
       //Increment seen packets
-      PACKET_COUNTER.increment(0);
+      COUNTERS.increment(0);
 
       /*Parsing L4 UDP*/
       struct udphdr *udp = head;
@@ -203,7 +221,7 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
       if(check_blacklisted(&key, value)) return DROP;
 
 #if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
-      if(check_tracked_or_max(&key, value)) return PASS;
+      if(check_tracked_or_max(&key, &infos)) return PASS;
 #ifdef UDP_LEN
       new_features.udp_len=bpf_ntohs(udp->len) - sizeof(*udp);
 #endif
@@ -212,7 +230,7 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
     }
     case IPPROTO_ICMP: {
       //Increment seen packets
-      PACKET_COUNTER.increment(0);
+      COUNTERS.increment(0);
 
       //Parsing L4 ICMP
       struct icmphdr *icmp = head;
@@ -224,7 +242,7 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
       if(check_blacklisted(&key, value)) return DROP;
 
 #if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
-      if(check_tracked_or_max(&key, value)) return PASS;
+      if(check_tracked_or_max(&key, &infos)) return PASS;
 #ifdef ICMP_TYPE
       new_features.icmp_type=icmp->type;
 #endif
@@ -258,3 +276,4 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
 
   return PASS;
 }
+#endif

@@ -1,19 +1,16 @@
-import ctypes as ct
 import os
 import random
 import time
-from abc import abstractclassmethod
 from base64 import b64decode
 
 import numpy as np
+import tensorflow as tf
 from dechainy.utility import cint_type_limit
 
-from .utility import RunState, _keys_map
-
+from .utility import Checkpoint
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-import tensorflow as tf
 SEED = 1
 # Seed Random Numbers
 os.environ['PYTHONHASHSEED'] = str(SEED)
@@ -22,21 +19,18 @@ random.seed(SEED)
 tf.random.set_seed(SEED)
 tf.keras.backend.set_image_data_format('channels_last')
 
-        
 
-class BaseEngine:
-    def __init__(self, run_state):
-        self.run_state: RunState = run_state
-
+class DetectionEngine:
     def __del__(self):
-        if hasattr(self, "model"):
+        try:
             del self.model
-        tf.keras.backend.clear_session()
+            tf.keras.backend.clear_session()
+        except Exception:
+            pass
 
     def on_update(self, analysis_state):
         self.analysis_state = analysis_state
-        self.additional_parse = self.parse_ebpf if 'ebpf' in self.analysis_state.extraction_type else lambda x: x
-        
+
         # feature list with min and max values (None has to be set at runtime)
         feature_list = [cint_type_limit(
             x[1]) for x in self.analysis_state.features.values()]
@@ -62,11 +56,11 @@ class BaseEngine:
         # warmup
         for _ in range(10):
             self.model.predict(np.expand_dims(np.array([
-                self.normalize_and_padding_sample(np.array([[random.randint(
+                self._normalize_and_padding_sample(np.array([[random.randint(
                     0, 10) for _ in range(analysis_state.active_features)]], dtype=float)),
             ]), axis=3), batch_size=analysis_state.batch_size)
 
-    def normalize_and_padding_sample(self, sample, high: float = 1.0, low: float = 0.0):
+    def _normalize_and_padding_sample(self, sample, high: float = 1.0, low: float = 0.0):
         # if the sample is bigger than expected, we cut the sample
         if sample.shape[0] > self.analysis_state.packets_per_session:
             sample = sample[:self.analysis_state.packets_per_session, ...]
@@ -78,62 +72,26 @@ class BaseEngine:
         return np.pad(norm_sample, ((
             0, self.analysis_state.packets_per_session - sample.shape[0]), (0, 0)), 'constant', constant_values=(0, 0))
 
-    def parse_ebpf(self, packets_raw):
-        session_map = {}
-        feature_decl = self.p["PACKET_BUFFER_DDOS"].Leaf
-        for raw in packets_raw:
-            skb_event = ct.cast(raw, ct.POINTER(feature_decl)).contents
-            sess_id = tuple([getattr(skb_event.id, x)
-                             for x in _keys_map.keys()])
-            features = [getattr(skb_event, x)
-                        for x in self.analysis_state.features]
-            if sess_id not in session_map:
-                session_map[sess_id] = []
-            session_map[sess_id].append(features)
-        return session_map
+    def predict(self, packets_dict, checkpoints):
+        if not packets_dict:
+            ttmp = time.time_ns()
+            checkpoints.append(Checkpoint("manipulation", ttmp))
+            checkpoints.append(Checkpoint("prediction", ttmp))
+            return []
 
-    @abstractclassmethod
-    def handle_extraction(self):
-        pass
-
-
-class DebugEngine(BaseEngine):
-    def handle_extraction(self, sess_map_or_packets):
-        predictions, data, checkpoints = [], [], []
-
-        if not sess_map_or_packets:
-            return [time.time_ns()] * 4
+        data = []
         
-        checkpoints.append(time.time_ns())
-        sess_map_or_packets = self.additional_parse(sess_map_or_packets)
-        for v in sess_map_or_packets.values():
-            data.append(self.normalize_and_padding_sample(
+        for v in packets_dict.values():
+            if not v.is_tracked:
+                continue
+            data.append(self._normalize_and_padding_sample(
                 np.array(v.pkts, dtype=float)))
+            
         data = np.array(data)
         data = np.expand_dims(data, axis=3)
-        checkpoints.append(time.time_ns())
+        checkpoints.append(Checkpoint("manipulation", time.time_ns()))
         predictions = np.squeeze(self.model.predict(
             data, batch_size=self.analysis_state.batch_size), axis=1)
-        checkpoints.append(time.time_ns())
-        checkpoints.append(time.time_ns())
+        checkpoints.append(Checkpoint("prediction", time.time_ns()))
 
-        return predictions, sess_map_or_packets, checkpoints
-
-
-class FullEngine(BaseEngine):
-    
-    def handle_extraction(self, sess_map_or_packets):
-        predictions, data = [], []
-
-        if not sess_map_or_packets:
-            return
-
-        sess_map_or_packets = self.additional_parse(sess_map_or_packets)
-        for v in sess_map_or_packets.values():
-            data.append(self.normalize_and_padding_sample(
-                np.array(v.pkts, dtype=float)))
-        data = np.array(data)
-        data = np.expand_dims(data, axis=3)
-        predictions = np.squeeze(self.model.predict(
-            data, batch_size=self.analysis_state.batch_size), axis=1)
         return predictions

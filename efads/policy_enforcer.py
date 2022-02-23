@@ -1,13 +1,24 @@
 import ctypes as ct
+import time
 
-from .utility import _keys_map
+from .utility import _keys_map, Checkpoint
+
 
 class PolicyEnforcer:
-    def handle(self, map_ref, predictions, sess_map_or_packets):
-        for i, p in zip(sess_map_or_packets, predictions):
-            if p <= 0.5:
+    def enforce(self, programs, predictions, packets_dict, checkpoints):
+        black_map_ref = programs['ingress']['BLACKLISTED_IPS']
+        i = -1
+        for sess_id, v in packets_dict.items():
+            if not v.is_tracked:
                 continue
-            key = map_ref.Key()
-            [setattr(key, n, i[j]) for j, n in enumerate(_keys_map.keys())]
-            if key not in map_ref:
-                map_ref[key] = ct.c_ulong(0)
+            i += 1
+            if predictions[i] <= 0.5:
+                continue
+            v.is_predicted_malicious = True
+            key = black_map_ref.Key()
+            [setattr(key, name, val) for name, val in zip(_keys_map.keys(), sess_id)]
+            if key not in black_map_ref:
+                black_map_ref[key] = ct.c_ulong(0)
+                v.is_enforced = True
+        checkpoints.append(Checkpoint("enforce", time.time_ns()))
+

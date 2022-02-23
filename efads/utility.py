@@ -1,11 +1,11 @@
 import ctypes as ct
+from enum import Enum
 import json
 import os
 import socket
 import struct
 import time
 from dataclasses import dataclass, field
-from threading import Thread, Event 
 from multiprocessing.managers import BaseManager, NamespaceProxy
 from typing import Dict, List, OrderedDict
 
@@ -13,6 +13,13 @@ from bcc import BPF
 from dechainy.ebpf import MetricFeatures, Program, SwapStateCompile
 from pypacker.layer3 import icmp, ip
 from pypacker.layer4 import tcp, udp
+
+
+def get_ordered_key(sess_id):
+    # lowest IP goes first in the identifier, to facilitate grouping packets
+    if sess_id[1] < sess_id[0]:
+        sess_id = [sess_id[1], sess_id[0], sess_id[3], sess_id[2], sess_id[4]]
+    return tuple(sess_id)
 
 
 def get_saddr(x):
@@ -28,7 +35,7 @@ def get_sport(x):
 
 
 def get_dport(x):
-    return socket.htons(x[tcp.TCP].dport) if x[tcp.TCP] else socket.htons(x[udp.UDP].dport)
+    return socket.htons(x[tcp.TCP].dport) if x[tcp.TCP] else socket.htons(x[udp.UDP].dport) if x[udp.UDP] else 0
 
 
 def get_proto(x):
@@ -72,24 +79,24 @@ def get_icmp_type(x):
 
 
 _keys_map: Dict = OrderedDict([
-    ("saddr", (get_saddr, ct.c_uint32)),
-    ("daddr", (get_daddr, ct.c_uint16)),
-    ("sport", (get_sport, ct.c_uint16)),
-    ("dport", (get_dport, ct.c_uint16)),
-    ("proto", (get_proto, ct.c_uint16)),
+    ("saddr", (get_saddr, ct.c_uint32, 1)),
+    ("daddr", (get_daddr, ct.c_uint32, 1)),
+    ("sport", (get_sport, ct.c_uint16, 1)),
+    ("dport", (get_dport, ct.c_uint16, 1)),
+    ("proto", (get_proto, ct.c_uint8, 1)),
 ])
 
 _features_map: Dict = {
     "perpacket": OrderedDict([
-        ("timestamp", (get_timestamp, ct.c_uint64)),
-        ("ip_len", (get_ip_len, ct.c_uint16)),
-        ("ip_flags", (get_ip_flags, ct.c_uint16)),
-        ("tcp_len", (get_tcp_len, ct.c_uint16)),
-        ("tcp_ack", (get_tcp_ack, ct.c_uint32)),
-        ("tcp_flags", (get_tcp_flags, ct.c_uint16)),
-        ("tcp_win", (get_tcp_win, ct.c_uint16)),
-        ("udp_len", (get_udp_len, ct.c_uint16)),
-        ("icmp_type", (get_icmp_type, ct.c_uint8))
+        ("timestamp", (get_timestamp, ct.c_uint64, 5)),
+        ("ip_len", (get_ip_len, ct.c_uint16, 1)),
+        ("ip_flags", (get_ip_flags, ct.c_uint16, 1)),
+        ("tcp_len", (get_tcp_len, ct.c_uint16, 1)),
+        ("tcp_ack", (get_tcp_ack, ct.c_uint32, 1)),
+        ("tcp_flags", (get_tcp_flags, ct.c_uint16, 1)),
+        ("tcp_win", (get_tcp_win, ct.c_uint16, 1)),
+        ("udp_len", (get_udp_len, ct.c_uint16, 1)),
+        ("icmp_type", (get_icmp_type, ct.c_uint8, 1))
     ]),
     "aggregate": OrderedDict([])
 }
@@ -113,6 +120,12 @@ class HookModulesConfig:
 
 
 @dataclass
+class Checkpoint:
+    name: str
+    value: int
+
+
+@dataclass
 class RunState:
     interface: str = "lo"
     timeout: int = 1000000
@@ -126,11 +139,26 @@ class RunState:
 class ConsumptionState:
     os_cpu: int = 0
     os_mem: int = 0
-    efads_cpu: int = 0
-    efads_mem: int = 0
+
+
+class Costs(Enum):
+    L4_COST = 10
+    BLACKLIST_LOOKUP_COST = 1
+    SPACE_LOOKUP_COST = 1
+    KEY_INSERTION_COST = 2
+    STORE_PACKET_COST = 2
     
-    def update(self):
-        pass
+
+class SafeProgram(Program):
+    def __del__(self):
+        os.close(self.f.fd)
+        super().__del__()
+
+
+class SafeSwap(SwapStateCompile):
+    def __del__(self):
+        os.close(self.f_1.fd)
+        super().__del__()
 
 
 @dataclass
@@ -175,11 +203,19 @@ class AnalysisState:
     
     @property
     def features_size(self):
-        return sum([ct.sizeof(v[1]) for k, v in self.features.items()])
+        return sum([ct.sizeof(v[1]) for v in self.features.values()])
+    
+    @property
+    def features_cost(self):
+        return sum([v[2] for v in self.features.values()])
 
     @property
     def keys_size(self):
-        return sum([ct.sizeof(v[1]) for v in _keys_map.values()])
+        return sum([ct.sizeof(v[1]) for v in _keys_map.values()]), ct.sizeof(ct.c_uint64)
+    
+    @property
+    def keys_cost(self):
+        return sum([v[2] for v in _keys_map.values()]) + Costs.L4_COST.value if "sport" in _keys_map or "dport" in _keys_map else 0
     
     def reconstruct_programs(self, mode: int):
         ret = {}
@@ -191,13 +227,13 @@ class AnalysisState:
                 continue
 
             if hook.module_swap_fd <= 0:
-                p = Program(interface=None, idx=None, mode=mode, code='int internal_handler(){return 0;}',
+                p = SafeProgram(interface=None, idx=None, mode=mode, code='int internal_handler(){return 0;}',
                             cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
                             program_id=hook.program_id, features=hook.bpf_features)
                 p.bpf.module = hook.module_fd
                 p.bpf.cleanup = lambda: None
             else:
-                p = SwapStateCompile(interface=None, idx=None, mode=mode, code='int internal_handler(){return 0;}',
+                p = SafeSwap(interface=None, idx=None, mode=mode, code='int internal_handler(){return 0;}',
                                      cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
                                      program_id=hook.program_id, code_1='int internal_handler(){return 0;}',
                                      chain_map='{}_next_{}'.format(
@@ -227,6 +263,9 @@ class MyManager(BaseManager):
 @dataclass
 class SessionValue:
     tot_pkts: int = 0
+    is_tracked: bool = False
+    is_predicted_malicious: bool = False
+    is_enforced: bool = False
     pkts: List = field(default_factory=list)
 
     @property
@@ -252,124 +291,23 @@ class InfoMetric:
     fp_no_space_pkts: int = 0
     tn_no_space_pkts: int = 0
     fn_no_space_pkts: int = 0
+    tp_mit: int = 0
+    fp_mit: int = 0
     tp_mit_pkts: int = 0
     fp_mit_pkts: int = 0
-    tn_mit_pkts: int = 0
-    fn_mit_pkts: int = 0
+    other_tp_pkts_no_space: int = 0
+    other_tn_pkts_no_space: int = 0
+    other_pkts_no_space: int = 0
 
 
 @dataclass
-class TimeWindowResultManager(ConsumptionState):
-    unique: InfoMetric = field(default_factory=InfoMetric)
-    general: InfoMetric = field(default_factory=InfoMetric)
-    tp_other_mitigated: int = 0
-    fp_other_mitigated: int = 0
-    other_pkts_no_space: int = 0
-    controls_time: int = 0
-    extraction_time: int = 0
-    queue_time: int = 0
-    parse_time: int = 0
-    prediction_time: int = 0
-    blacklist_time: int = 0
-    total_time: int = 0
+class TimeWindowResultManager():
+    consumptions: ConsumptionState = field(default_factory=ConsumptionState)
+    metrics: InfoMetric = field(default_factory=InfoMetric)
+    times: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
 class GlobalResultManager(TimeWindowResultManager):
     time_window_values: List[TimeWindowResultManager] = field(
         default_factory=list)
-    attackers: List[List] = field(default_factory=list, repr=False)
-
-    def __post_init__(self):
-        self.seen_sess = {}
-        self.real_malicious_len = len(self.attackers[0])
-        self.real_malicious = dict.fromkeys(
-            [tuple(x) for x in self.attackers], None)
-        self.global_black_map = {}
-        
-    def get_black_map_tw(self, black_map):
-        ret = {}
-        for k in black_map.keys():
-            if k not in self.seen_sess and k[:self.real_malicious_len] in self.real_malicious and k in self.global_black_map:
-                print("ERRORINOOOOOOOOOOO")
-            ret[k] = black_map[k] if k not in self.global_black_map else black_map[k]-self.global_black_map[k]
-            if ret[k] == 0:
-                del ret[k]
-        self.global_black_map = black_map
-        return ret
-    
-    def end_tw(self, predictions, packets_session_map, pkts_received, black_map, checkpoints):    
-        tw_black_map = self.get_black_map_tw(black_map)
-        tw_res = TimeWindowResultManager(
-            controls_time=checkpoints[1] - checkpoints[0],
-            extraction_time=checkpoints[2] - checkpoints[1],
-            queue_time=checkpoints[3] - checkpoints[2],
-            parse_time=checkpoints[4] - checkpoints[3],
-            prediction_time=checkpoints[5] - checkpoints[4],
-            blacklist_time=checkpoints[6] - checkpoints[5],
-            total_time=checkpoints[6] - checkpoints[0]
-        )
-
-        for sess_id, pred in zip(packets_session_map, predictions):
-            is_already_seen = sess_id in self.seen_sess
-            is_malicious = sess_id[:self.real_malicious_len] in self.real_malicious
-            is_predicted_malicious = pred > 0.5
-            self.seen_sess[sess_id] = (self.seen_sess[sess_id] or is_predicted_malicious) if is_already_seen else is_predicted_malicious
-            val: SessionValue = packets_session_map[sess_id]
-            pkts_received -= val.ignored_pkts + val.received_pkts
-            
-            cond = {
-                "tp": is_malicious and is_predicted_malicious,
-                "fp": is_predicted_malicious and is_malicious != is_predicted_malicious,
-                "tn": not is_predicted_malicious and not is_malicious,
-                "fn": not is_predicted_malicious and is_malicious != is_predicted_malicious
-            }
-
-            for k, v in cond.items():
-                if not v:
-                    continue
-                setattr(tw_res.general, k, getattr(tw_res.general, k)+1)
-                setattr(tw_res.general, "{}_pkts".format(k), getattr(
-                    tw_res.general, "{}_pkts".format(k))+val.received_pkts)
-                setattr(tw_res.general, "{}_no_space_pkts".format(k), getattr(
-                    tw_res.general, "{}_no_space_pkts".format(k))+val.ignored_pkts)
-                
-                if not is_already_seen:
-                    setattr(tw_res.unique, k, getattr(tw_res.unique, k)+1)
-                    setattr(tw_res.unique, "{}_pkts".format(k), getattr(
-                        tw_res.unique, "{}_pkts".format(k))+val.received_pkts)
-                    setattr(tw_res.unique, "{}_no_space_pkts".format(k), getattr(
-                        tw_res.unique, "{}_no_space_pkts".format(k))+val.ignored_pkts)
-                
-                if sess_id in tw_black_map:
-                    setattr(tw_res.general, "{}_mit_pkts".format(k), getattr(
-                        tw_res.general, "{}_mit_pkts".format(k))+tw_black_map[sess_id])
-                    if not is_already_seen:
-                      setattr(tw_res.unique, "{}_mit_pkts".format(k), getattr(
-                          tw_res.unique, "{}_mit_pkts".format(k))+tw_black_map[sess_id])
-                    pkts_received -= tw_black_map[sess_id]
-                    del tw_black_map[sess_id]
-                
-        for k,v in tw_black_map.items():
-            if k not in self.seen_sess:
-                print("ERRORE DELLA MADONNA")
-            is_predicted_malicious = self.seen_sess[k]
-            is_malicious = k[:self.real_malicious_len] in self.real_malicious
-            if is_predicted_malicious and is_malicious != is_predicted_malicious:
-                tw_res.fp_other_mitigated += v
-            else:
-                tw_res.tp_other_mitigated += v
-            pkts_received -= v
-            
-        tw_res.other_pkts_no_space = pkts_received
-        
-        for k, v in tw_res.__dict__.items():
-            kobj = getattr(tw_res, k)
-            if isinstance(kobj, InfoMetric):
-                mobj = getattr(self, k)
-                for kk, vv in kobj.__dict__.items():
-                    setattr(mobj, kk, vv + getattr(mobj, kk))
-            else:
-                setattr(self, k, v + getattr(self, k))
-
-        self.time_window_values.append(tw_res)
