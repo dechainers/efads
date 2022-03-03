@@ -16,15 +16,15 @@
 #ifndef SESSION_PER_TIME_WINDOW
 #error SESSION_PER_TIME_WINDOW must be defined
 #endif
-// Number of packet from the same TCP session
-#ifndef PACKETS_PER_SESSION
-#error PACKETS_PER_SESSION must be defined
-#endif
-// Number of total packets at the same time
-#define N_PACKET_TOTAL              SESSION_PER_TIME_WINDOW * PACKETS_PER_SESSION
+
 // Number of maximum blacklisted sessions
 #ifndef MAX_BLOCKED_SESSIONS
 #error MAX_BLOCKED_SESSIONS must be defined
+#endif
+
+#ifdef PERPACKET && !defined(PACKETS_PER_SESSION)
+// Number of packet from the same TCP session
+#error PACKETS_PER_SESSION must be defined
 #endif
 
 //Session identifier
@@ -38,6 +38,7 @@ struct session_key {
 
 //Features to be exported
 struct features {
+#ifdef PERPACKET
     struct session_key id;                       //Session identifier
 #ifdef TIMESTAMP
     u64 timestamp;                               //Packet timestamp
@@ -68,44 +69,51 @@ struct features {
 #ifdef ICMP_TYPE
     u8 icmp_type;                                //ICMP operation type
 #endif
+#else
+// TODO: Implement aggregate features
+#ifdef N_PACKETS
+    uint64_t n_packets;                             // Number of packets on one direction
+    uint64_t n_packets_reverse;                     // Number of packets on opposite direction
+#endif
+#endif
 };
 
 struct track_info {
   u64 packets;
   u8 is_tracked;
+#ifdef AGGREGATE
+  struct features features;
+#endif
 };
 
 // Map for blacklisting sessions
 // Map for collecting packets
-
-#ifdef TEST_SIMULATED
-BPF_TABLE_SHARED("hash", struct session_key, u64, BLACKLISTED_IPS, MAX_BLOCKED_SESSIONS);
-// 0 PACKETS, 1 N° tracked SESSIONS
-BPF_TABLE_SHARED("array", int, u64, COUNTERS, 2)__attributes__((SWAP));
-static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md) {
-  return PASS;
-}
-#else
-
 // Map support for checking currently tracked sessions
 #if INGRESS
 BPF_TABLE_SHARED("hash", struct session_key, u64, BLACKLISTED_IPS, MAX_BLOCKED_SESSIONS);
 // 0 PACKETS, 1 N° tracked SESSIONS
 BPF_TABLE_SHARED("array", int, u64, COUNTERS, 2)__attributes__((SWAP));
+#if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
 BPF_TABLE_SHARED("hash", struct session_key, struct track_info, SESSIONS_TRACKED_DDOS, SESSION_PER_TIME_WINDOW_MAP)__attributes__((SWAP));
+#ifdef PERPACKET
 #ifdef TEST_EBPF
-BPF_QUEUESTACK_SHARED("queue", PACKET_BUFFER_DDOS, struct features, N_PACKET_TOTAL, 0)__attributes__((SWAP));
-#elif defined TEST_EBPF_PERF
+BPF_QUEUESTACK_SHARED("queue", PACKET_BUFFER_DDOS, struct features, PACKETS_PER_SESSION*SESSION_PER_TIME_WINDOW, 0)__attributes__((SWAP));
+#else
 BPF_PERF_SHARED("perf_output", CUSTOM_TO_CP);
+#endif
+#endif
 #endif
 #else
 BPF_TABLE("extern", struct session_key, u64, BLACKLISTED_IPS, MAX_BLOCKED_SESSIONS);
 BPF_TABLE("extern", int, u64, COUNTERS, 2)__attributes__((SWAP));
+#if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
 BPF_TABLE("extern", struct session_key, struct track_info, SESSIONS_TRACKED_DDOS, SESSION_PER_TIME_WINDOW_MAP)__attributes__((SWAP));
+#ifdef PERPACKET
 #ifdef TEST_EBPF
-BPF_QUEUESTACK("extern", PACKET_BUFFER_DDOS, struct features, N_PACKET_TOTAL, 0)__attributes__((SWAP));
-#elif defined TEST_EBPF_PERF
+BPF_QUEUESTACK("extern", PACKET_BUFFER_DDOS, struct features, PACKETS_PER_SESSION*SESSION_PER_TIME_WINDOW, 0)__attributes__((SWAP));
+#else
 BPF_PERF("extern", CUSTOM_TO_CP);
+#endif
 #endif
 #endif
 
@@ -148,7 +156,9 @@ static __always_inline int check_tracked_or_max(struct session_key *key, struct 
     COUNTERS.increment(1);
   }
 
+#ifdef PERPACKET
   if (value->packets > PACKETS_PER_SESSION) return 1;
+#endif
   return 0;
 }
 
@@ -171,9 +181,10 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
   //Initialize values to be used
   u64 *value = NULL;
   struct session_key key = {0};
-  struct features new_features = {0};
   struct track_info infos = {0};
-  
+#ifdef PERPACKET
+  struct features new_features = {0};  
+#endif
   switch (ip->protocol) {
     case IPPROTO_TCP: {
       //Increment seen packets
@@ -188,9 +199,12 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
       
       if(check_blacklisted(&key, value)) return DROP;
 
-#if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
+#ifdef TEST_SOCKET
+      return PASS;
+#else
       if(check_tracked_or_max(&key, &infos)) return PASS;
 
+#ifdef PERPACKET
 #ifdef TCP_ACK
       new_features.tcp_ack=bpf_ntohl(tcp->ack_seq);
 #endif
@@ -203,6 +217,13 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
 #ifdef TCP_FLAGS
       new_features.tcp_flags=(tcp->cwr << 7) | (tcp->ece << 6) | (tcp->urg << 5) | (tcp->ack << 4)
                 | (tcp->psh << 3)| (tcp->rst << 2) | (tcp->syn << 1) | tcp->fin;
+#endif
+#else
+
+#ifdef N_PACKETS
+      infos.n_packets += 1;
+#endif
+
 #endif
 #endif
       break;
@@ -220,10 +241,21 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
 
       if(check_blacklisted(&key, value)) return DROP;
 
-#if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
+#ifdef TEST_SOCKET
+      return PASS;
+#else
       if(check_tracked_or_max(&key, &infos)) return PASS;
+
+#ifdef PERPACKET
 #ifdef UDP_LEN
       new_features.udp_len=bpf_ntohs(udp->len) - sizeof(*udp);
+#endif
+#else
+
+#ifdef N_PACKETS
+      infos.n_packets += 1;
+#endif
+
 #endif
 #endif
       break;
@@ -241,10 +273,21 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
 
       if(check_blacklisted(&key, value)) return DROP;
 
-#if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
+#ifdef TEST_SOCKET
+      return PASS;
+#else
       if(check_tracked_or_max(&key, &infos)) return PASS;
+
+#ifdef PERPACKET
 #ifdef ICMP_TYPE
       new_features.icmp_type=icmp->type;
+#endif
+#else
+
+#ifdef N_PACKETS
+      infos.n_packets += 1;
+#endif
+
 #endif
 #endif
       break;
@@ -255,6 +298,7 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
     }
   }
 
+#ifdef PERPACKET
 #if defined(TEST_EBPF) || defined(TEST_EBPF_PERF)
 #ifdef TIMESTAMP
   new_features.timestamp=get_time_epoch(ctx);
@@ -271,6 +315,7 @@ static __always_inline int handler(struct CTXTYPE *ctx, struct pkt_metadata *md)
   PACKET_BUFFER_DDOS.push(&new_features, 0);
 #else
   CUSTOM_TO_CP.perf_submit(ctx, &new_features, sizeof(new_features));
+#endif
 #endif
 #endif
 

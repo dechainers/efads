@@ -1,18 +1,25 @@
 import ctypes as ct
-from enum import Enum
 import json
 import os
 import socket
 import struct
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from multiprocessing.managers import BaseManager, NamespaceProxy
-from typing import Dict, List, OrderedDict
+from typing import Dict, List, OrderedDict, Union
 
 from bcc import BPF
 from dechainy.ebpf import MetricFeatures, Program, SwapStateCompile
 from pypacker.layer3 import icmp, ip
 from pypacker.layer4 import tcp, udp
+
+
+def cint_type_limit(c_int_type):
+    signed = c_int_type(-1).value < c_int_type(0).value
+    bit_size = ct.sizeof(c_int_type) * 8
+    signed_limit = 2 ** (bit_size - 1)
+    return (-signed_limit, signed_limit - 1) if signed else (0, 2 * signed_limit - 1)
 
 
 def get_ordered_key(sess_id):
@@ -86,29 +93,17 @@ _keys_map: Dict = OrderedDict([
     ("proto", (get_proto, ct.c_uint8, 1)),
 ])
 
-_features_map: Dict = {
-    "perpacket": OrderedDict([
-        ("timestamp", (get_timestamp, ct.c_uint64, 5)),
-        ("ip_len", (get_ip_len, ct.c_uint16, 1)),
-        ("ip_flags", (get_ip_flags, ct.c_uint16, 1)),
-        ("tcp_len", (get_tcp_len, ct.c_uint16, 1)),
-        ("tcp_ack", (get_tcp_ack, ct.c_uint32, 1)),
-        ("tcp_flags", (get_tcp_flags, ct.c_uint16, 1)),
-        ("tcp_win", (get_tcp_win, ct.c_uint16, 1)),
-        ("udp_len", (get_udp_len, ct.c_uint16, 1)),
-        ("icmp_type", (get_icmp_type, ct.c_uint8, 1))
-    ]),
-    "aggregate": OrderedDict([])
-}
-
-
-@dataclass
-class DebugConfiguration:
-    attackers: Dict
-    dump_file: str
-    max_duration: int = 300
-    n_timewindows_empty: int = 20
-    pcaps: List[str] = field(default_factory=list)
+_features_map: OrderedDict([
+    ("timestamp", (get_timestamp, ct.c_uint64, 5)),
+    ("ip_len", (get_ip_len, ct.c_uint16, 1)),
+    ("ip_flags", (get_ip_flags, ct.c_uint16, 1)),
+    ("tcp_len", (get_tcp_len, ct.c_uint16, 1)),
+    ("tcp_ack", (get_tcp_ack, ct.c_uint32, 1)),
+    ("tcp_flags", (get_tcp_flags, ct.c_uint16, 1)),
+    ("tcp_win", (get_tcp_win, ct.c_uint16, 1)),
+    ("udp_len", (get_udp_len, ct.c_uint16, 1)),
+    ("icmp_type", (get_icmp_type, ct.c_uint8, 1))
+])
 
 
 @dataclass
@@ -125,20 +120,16 @@ class Checkpoint:
     value: int
 
 
-@dataclass
-class RunState:
-    interface: str = "lo"
-    timeout: int = 1000000
-    operational_mode: str = "simulated"
-    debug: DebugConfiguration = None
-    mode: int = BPF.SCHED_CLS
-    daemon: bool = False
+class OperationalMode(Enum):
+    SIMULATED = "simulated"
+    SOCKET = "socket"
+    EBPF = "ebpf"
+    FILTERED_EBPF = "filtered_ebpf"
 
 
-@dataclass
-class ConsumptionState:
-    os_cpu: int = 0
-    os_mem: int = 0
+class ExtractionType(Enum):
+    PERPACKET = "perpacket"
+    AGGREGATE = "aggregate"
 
 
 class Costs(Enum):
@@ -147,7 +138,34 @@ class Costs(Enum):
     SPACE_LOOKUP_COST = 1
     KEY_INSERTION_COST = 2
     STORE_PACKET_COST = 2
-    
+
+
+@dataclass
+class DebugConfiguration:
+    attackers: Dict
+    dump_dir: str
+    max_duration: int = 300
+    top_frequence: float = 0.1
+
+
+@dataclass
+class RunState:
+    daemon: bool = False
+    operational_mode: Union[str, OperationalMode] = OperationalMode.SIMULATED
+    debug: DebugConfiguration = field(default_factory=DebugConfiguration)
+
+    def __post_init__(self):
+        if isinstance(self.operational_mode, str):
+            self.operational_mode = OperationalMode(self.operational_mode)
+        if self.operational_mode == OperationalMode.SIMULATED:
+            self.daemon = False
+
+
+@dataclass
+class ConsumptionState:
+    os_cpu: int = 0
+    os_mem: int = 0
+
 
 class SafeProgram(Program):
     def __del__(self):
@@ -163,12 +181,13 @@ class SafeSwap(SwapStateCompile):
 
 @dataclass
 class AnalysisState:
-    extraction_type: str = "perpacket"
-    
+    extraction_type: ExtractionType = ExtractionType.PERPACKET
+
     sessions_per_time_window: int = 10000
+    sessions_per_time_window_map: int = 10000
     max_blocked_sessions: int = 100000
-    time_window: int = 10
-    
+    time_window: float = 10
+
     packets_per_session: int = 10
     active_features: int = 9
 
@@ -182,41 +201,50 @@ class AnalysisState:
         default_factory=HookModulesConfig)
 
     def __post_init__(self):
+        if isinstance(self.extraction_type, str):
+            self.extraction_type = ExtractionType(self.extraction_type)
+        if self.sessions_per_time_window_map < self.sessions_per_time_window:
+            self.sessions_per_time_window_map = self.sessions_per_time_window
         weights_file = os.path.join(self.model_dir, "weights.json")
         if not os.path.isfile(weights_file):
             raise Exception("No weights file found")
         with open(weights_file, "r") as fp:
             weights = json.load(fp)
-        
-        if self.extraction_type == "perpacket":
-            weights = weights[str(self.packets_per_session)][str(self.active_features)]
+
+        if self.extraction_type == ExtractionType.PERPACKET:
+            weights = weights[str(self.packets_per_session)
+                              ][str(self.active_features)]
         else:
             weights = weights[str(self.active_features)]
-            
-        features_names = list(_features_map[self.extraction_type].keys())
-        active_names = [features_names[i] for _, i in weights][:self.active_features]
-        self.features = {k: v for k, v in _features_map[self.extraction_type].items() if k in active_names}
-    
+
+        features_names = list(_features_map.keys())
+        active_names = [features_names[i]
+                        for _, i in weights][:self.active_features]
+        self.features = {
+            k: v for k, v in _features_map.items() if k in active_names}
+
     @property
     def model_name(self):
-        return os.path.join(self.model_dir, "{}p-{}f.h5".format(self.packets_per_session, self.active_features) if self.extraction_type == "perpacket" else "{}.h5".format(self.active_features))
-    
+        return os.path.join(self.model_dir, "{}p-{}f.h5".format(self.packets_per_session, self.active_features)
+                            if self.extraction_type == ExtractionType.PERPACKET else "{}.h5".format(self.active_features))
+
     @property
     def features_size(self):
         return sum([ct.sizeof(v[1]) for v in self.features.values()])
-    
+
     @property
     def features_cost(self):
         return sum([v[2] for v in self.features.values()])
 
     @property
     def keys_size(self):
-        return sum([ct.sizeof(v[1]) for v in _keys_map.values()]), ct.sizeof(ct.c_uint64)
-    
+        return sum([ct.sizeof(v[1]) for v in _keys_map.values()])
+
     @property
     def keys_cost(self):
-        return sum([v[2] for v in _keys_map.values()]) + Costs.L4_COST.value if "sport" in _keys_map or "dport" in _keys_map else 0
-    
+        return sum([v[2] for v in _keys_map.values()]) +\
+            Costs.L4_COST.value if "sport" in _keys_map or "dport" in _keys_map else 0
+
     def reconstruct_programs(self, mode: int):
         ret = {}
         for htype in ['ingress', 'egress']:
@@ -228,16 +256,16 @@ class AnalysisState:
 
             if hook.module_swap_fd <= 0:
                 p = SafeProgram(interface=None, idx=None, mode=mode, code='int internal_handler(){return 0;}',
-                            cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
-                            program_id=hook.program_id, features=hook.bpf_features)
+                                cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
+                                program_id=hook.program_id, features=hook.bpf_features)
                 p.bpf.module = hook.module_fd
                 p.bpf.cleanup = lambda: None
             else:
                 p = SafeSwap(interface=None, idx=None, mode=mode, code='int internal_handler(){return 0;}',
-                                     cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
-                                     program_id=hook.program_id, code_1='int internal_handler(){return 0;}',
-                                     chain_map='{}_next_{}'.format(
-                                         htype, 'xdp' if mode == BPF.XDP else 'tc'), features=hook.bpf_features)
+                             cflags=[], probe_id=-1, plugin_id=-1, debug=False, flags=None, offload_device=None,
+                             program_id=hook.program_id, code_1='int internal_handler(){return 0;}',
+                             chain_map='{}_next_{}'.format(
+                                 htype, 'xdp' if mode == BPF.XDP else 'tc'), features=hook.bpf_features)
                 p.bpf.module = hook.module_fd
                 p.bpf_1.module = hook.module_swap_fd
                 p.bpf.cleanup = lambda: None
@@ -266,15 +294,7 @@ class SessionValue:
     is_tracked: bool = False
     is_predicted_malicious: bool = False
     is_enforced: bool = False
-    pkts: List = field(default_factory=list)
-
-    @property
-    def received_pkts(self):
-        return len(self.pkts)
-
-    @property
-    def ignored_pkts(self):
-        return self.tot_pkts - self.received_pkts
+    pkts_or_counters: List = field(default_factory=list)        
 
 
 @dataclass
@@ -301,7 +321,7 @@ class InfoMetric:
 
 
 @dataclass
-class TimeWindowResultManager():
+class TimeWindowResultManager:
     consumptions: ConsumptionState = field(default_factory=ConsumptionState)
     metrics: InfoMetric = field(default_factory=InfoMetric)
     times: Dict[str, int] = field(default_factory=dict)
